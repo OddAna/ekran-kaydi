@@ -6,6 +6,11 @@ public final class SystemScreencaptureRecorder: ScreenRecorder {
     public static let toolPath = "/usr/sbin/screencapture"
 
     public var onUnexpectedStop: ((Result<URL, Error>) -> Void)?
+    public var onEvent: ((String) -> Void)?
+    /// `screencapture -v` mikrofonu yalnız başlarken alır; kayıt sürerken değiştirilemez.
+    public var supportsLiveMicrophoneToggle: Bool { false }
+
+    public func setMicrophoneEnabled(_ enabled: Bool) {}
 
     private var process: Process?
     private var outputURL: URL?

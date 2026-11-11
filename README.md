@@ -8,7 +8,15 @@ Kurulum ve ilk kullanım adım adım: [KURULUM.md](KURULUM.md).
 
 ## Özellikler
 
-- Menü çubuğundan **Kaydı Başlat / Kaydı Durdur**; kayıt sürerken simge kırmızı, yanında geçen süre.
+- Menü çubuğundan **Kaydı Başlat / Kaydı Durdur**; kayıt sürerken simge dolu daire, yanında geçen süre.
+  Simge her durumda şablon (template) görüntüdür, renk verilmez: macOS onu öteki menü simgeleri gibi çizer
+  (koyu çubukta beyaz). 1.0.0'daki kırmızı tint macOS 26+ menü çubuğunda siyaha dönüp kayboluyordu.
+- **Kayıt sürerken mikrofon aç/kapa** (macOS 13+): kayıt kesilmez, tek dosya olarak kalır. Mikrofon izi her
+  kayıtta vardır; kapalı geçen süre sessizlikle doldurulur, açılınca ses görüntüyle aynı yerde başlar.
+  Kapalıyken mikrofon gerçekten kapanır (macOS'un mikrofon göstergesi söner).
+- **Kulaklık/AirPods takıp çıkarma:** mikrofon her zaman macOS'un varsayılan girişini izler; varsayılan değişince,
+  aygıt koparsa ya da 2 sn ses gelmezse yeniden bağlanır. Sistem sesi çıkış aygıtından bağımsız yakalanır; akış 3 sn
+  durursa ScreenCaptureKit'in ses yakalaması yenilenir. Ses gelmeyen her an sessizlikle doldurulur, iz kaymaz.
 - **Ekran seçimi:** liste her menü açılışında o Mac'e bağlı ekranlardan (`NSScreen.screens`) kurulur.
   Kodda cihaza sabit ekran adı ya da kimliği yoktur; aynı adlı iki ekran "(1)", "(2)" diye ayrılır.
   Kayıtlı seçim artık bağlı değilse ana ekrana düşülür.
@@ -39,8 +47,8 @@ Kurulum ve ilk kullanım adım adım: [KURULUM.md](KURULUM.md).
 Gerekli: Xcode (27 ile denendi). Ek paket yok.
 
 ```sh
-sh scripts/build-app.sh 1.0.0 1
-# dist/Ekran Kaydı.app ve dist/Ekran-Kaydi-1.0.0.zip
+sh scripts/build-app.sh 1.1.0 2
+# dist/Ekran Kaydı.app, dist/Ekran-Kaydi-1.1.0.zip ve sürümsüz adlı kopya dist/Ekran-Kaydi.zip
 ```
 
 Betik universal `swift build -c release --arch arm64 --arch x86_64` yapar, `.app` paketini kurar,
@@ -61,8 +69,13 @@ kurulması ve aynı adlı ekranlar, kaynakta sabit ekran adı/kullanıcı yolu o
 uzatılması, mikrofon saatinin kaydırılması) ve karıştırıcı (tek ses izi, mikrofonun gerçekten karışması,
 boş sistem sesi izi, görüntünün yeniden sıkıştırılmaması).
 
-Gerçek ekran/sistem sesi yakalaması izin penceresi açtığı için otomatik testte yoktur; ilk gerçek deneme
-kurulduğu Mac'te yapılır.
+Gerçek ekran/sistem sesi yakalaması izin penceresi açtığı için otomatik testte yoktur. Uçtan uca deneme için
+geliştirici (debug) derlemesinde ortam değişkenleri vardır (yayın derlemesine girmez):
+`EKRANKAYDI_OTOTEST="2:baslat,6:mikrofon,10:mikrofon,31:sesyenile,38:durdur,46:cik"` menüye dokunmadan kayıt
+akışını sürer, olay satırlarını stderr'e yazar; `EKRANKAYDI_ARA_DOSYA=1` karıştırmadan önceki iki ses izli dosyayı
+saklar; `EKRANKAYDI_KENDI_SESI=1` kabuktan açılınca aynı kabuktan çalınan test sesinin dışlanmasını kapatır.
+Yayın derlemesinde aygıt olayları birleşik günlüğe yazılır:
+`log stream --predicate 'subsystem == "app.ekrankaydi.menubar"'`.
 
 ## Yapı
 
@@ -75,7 +88,9 @@ Sources/EkranKaydiCore/              kayıt motoru (test edilir)
   RecordingSettings.swift            ayarlar, kayıt yeri, dosya adı, süre biçimi
   Displays.swift                     ekran listesi (o Mac'ten), kayıt boyutu, bit hızı
   Recorder.swift                     istek, hatalar, macOS sürümüne göre motor seçimi
-  ScreenCaptureKitRecorder.swift     macOS 13+: SCStream + mikrofon (AVCaptureSession)
+  ScreenCaptureKitRecorder.swift     macOS 13+: SCStream + mikrofon, sessizlik doldurma, sistem sesi bekçisi
+  MicrophoneCapture.swift            kayıt boyunca mikrofon: aç/kapa, varsayılan girişi izleme, yeniden bağlanma
+  AudioDevices.swift                 CoreAudio varsayılan giriş/çıkış ve değişim dinleyicisi
   MovieWriter.swift                  H.264 + AAC .mov yazıcı (AVAssetWriter)
   AudioMixer.swift                   ses izlerini tek ize karıştırma (görüntü passthrough)
   SystemScreencaptureRecorder.swift  macOS 12: /usr/sbin/screencapture -v

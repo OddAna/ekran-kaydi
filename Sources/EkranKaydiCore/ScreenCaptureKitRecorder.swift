@@ -4,12 +4,24 @@ import CoreMedia
 import Foundation
 import ScreenCaptureKit
 
-/// macOS 13+ kayıt yolu: ScreenCaptureKit ile ekran + sistem sesi, AVFoundation ile isteğe bağlı mikrofon.
-/// Görüntü, sistem sesi ve mikrofon aynı seri kuyrukta tek bir `MovieWriter`a yazılır; ikisi birden
+/// macOS 13+ kayıt yolu: ScreenCaptureKit ile ekran + sistem sesi, AVFoundation ile mikrofon.
+/// Görüntü, sistem sesi ve mikrofon aynı seri kuyrukta tek bir `MovieWriter`a yazılır; sistem sesi de
 /// kaydedildiyse durdurunca `AudioMixer` sesleri tek ize karıştırır.
+///
+/// Mikrofon izi her kayıtta vardır; mikrofon kayıt sürerken açılıp kapatılabilir (`setMicrophoneEnabled`).
+/// Kapalı kaldığı ya da aygıt değişirken (kulaklık takılıp çıkarılırken) ses gelmeyen süre sessizlikle
+/// doldurulur, kayıt kesilmez. Sistem sesi akışı durursa ScreenCaptureKit'in ses yakalaması yenilenir.
 @available(macOS 13.0, *)
 public final class ScreenCaptureKitRecorder: NSObject, ScreenRecorder {
     public var onUnexpectedStop: ((Result<URL, Error>) -> Void)?
+    /// Teşhis için kısa olay satırları (aygıt değişimi, yeniden bağlanma). Ana kuyrukta gelmez.
+    public var onEvent: ((String) -> Void)?
+    public var supportsLiveMicrophoneToggle: Bool { true }
+
+    /// Ses gelmeyen izler en çok bu kadar geriden sessizlikle doldurulur (gecikmeli gelen gerçek sese yer kalsın).
+    static let gapFillDelay = CMTime(value: 1, timescale: 1)
+    /// Sistem sesi bu kadar süre gelmezse ScreenCaptureKit'in ses yakalaması yenilenir.
+    static let systemAudioStaleAfter: TimeInterval = 3
 
     private enum State {
         case idle
@@ -23,7 +35,11 @@ public final class ScreenCaptureKitRecorder: NSObject, ScreenRecorder {
     private var request: RecordingRequest?
     private var stream: SCStream?
     private var sink: CaptureSink?
-    private var microphoneSession: AVCaptureSession?
+    private var microphone: MicrophoneCapture?
+    private var configuration: SCStreamConfiguration?
+    private var maintenanceTimer: DispatchSourceTimer?
+    private var lastSystemAudioRestartUptime: TimeInterval = 0
+    private var isRestartingSystemAudio = false
 
     public override init() {
         super.init()
@@ -63,7 +79,8 @@ public final class ScreenCaptureKitRecorder: NSObject, ScreenRecorder {
             backingScale: request.display.backingScale
         )
         let fps = max(1, min(60, request.framesPerSecond))
-        let needsMix = request.recordsSystemAudio && request.recordsMicrophone
+        // Mikrofon izi her zaman açılır: kayıt sürerken mikrofon sonradan da açılabilsin.
+        let needsMix = request.recordsSystemAudio
         let writeURL = needsMix ? RecordingFileNamer.intermediateURL(for: request.outputURL) : request.outputURL
 
         let writer = try MovieWriter(
@@ -73,7 +90,7 @@ public final class ScreenCaptureKitRecorder: NSObject, ScreenRecorder {
                 height: size.height,
                 framesPerSecond: fps,
                 includesSystemAudio: request.recordsSystemAudio,
-                includesMicrophone: request.recordsMicrophone
+                includesMicrophone: true
             )
         )
         do {
@@ -111,6 +128,13 @@ public final class ScreenCaptureKitRecorder: NSObject, ScreenRecorder {
         configuration.channelCount = MovieWriter.audioChannelCount
         // Uygulamanın kendi sesi yok; yine de kendi uyarı seslerini kayda katmaz.
         configuration.excludesCurrentProcessAudio = true
+        #if DEBUG
+        // Geliştirici testi: uygulama kabuktan açılınca aynı kabuktan çalınan test sesi de "kendi sesi" sayılıp
+        // dışlanır. Uçtan uca denemede bu anahtarla dışlama kapatılır (yayın derlemesinde yok).
+        if ProcessInfo.processInfo.environment["EKRANKAYDI_KENDI_SESI"] == "1" {
+            configuration.excludesCurrentProcessAudio = false
+        }
+        #endif
 
         let filter = SCContentFilter(display: display, excludingWindows: [])
         let stream = SCStream(filter: filter, configuration: configuration, delegate: sink)
@@ -119,62 +143,90 @@ public final class ScreenCaptureKitRecorder: NSObject, ScreenRecorder {
             try stream.addStreamOutput(sink, type: .audio, sampleHandlerQueue: sampleQueue)
         }
 
-        var microphoneSession: AVCaptureSession?
-        if request.recordsMicrophone {
-            microphoneSession = try makeMicrophoneSession(sink: sink)
-        }
+        let microphone = try MicrophoneCapture(delegate: sink, sampleQueue: sampleQueue)
+        microphone.onEvent = { [weak self] message in self?.onEvent?(message) }
+        sink.microphone = microphone
+        sink.microphoneEnabled = request.recordsMicrophone
+        #if DEBUG
+        sink.onDebug = { [weak self] message in self?.onEvent?(message) }
+        #endif
 
         self.request = request
         self.stream = stream
         self.sink = sink
-        self.microphoneSession = microphoneSession
+        self.microphone = microphone
+        self.configuration = configuration
 
         stream.startCapture { [weak self] error in
             DispatchQueue.main.async {
                 guard let self else { return }
                 if let error {
                     self.sampleQueue.async { writer.cancel() }
+                    microphone.invalidate()
                     self.cleanUp()
                     completion(Self.mapStartError(error))
                     return
                 }
-                if let microphoneSession {
-                    DispatchQueue.global(qos: .userInitiated).async {
-                        microphoneSession.startRunning()
-                    }
+                if request.recordsMicrophone {
+                    microphone.setEnabled(true)
                 }
+                self.startMaintenance()
                 self.state = .recording
                 completion(nil)
             }
         }
     }
 
-    private func makeMicrophoneSession(sink: CaptureSink) throws -> AVCaptureSession {
-        guard let device = AVCaptureDevice.default(for: .audio) else {
-            throw RecordingError.microphoneUnavailable
-        }
-        let session = AVCaptureSession()
-        let input: AVCaptureDeviceInput
-        do {
-            input = try AVCaptureDeviceInput(device: device)
-        } catch {
-            throw RecordingError.microphoneUnavailable
-        }
-        let output = AVCaptureAudioDataOutput()
-        // Mikrofon da 48 kHz stereo gelir; sistem sesiyle aynı biçim karıştırmayı sorunsuz yapar.
-        output.audioSettings = MovieWriter.linearPCMSettings
-        output.setSampleBufferDelegate(sink, queue: sampleQueue)
+    // MARK: Kayıt sürerken
 
-        session.beginConfiguration()
-        guard session.canAddInput(input), session.canAddOutput(output) else {
-            session.commitConfiguration()
-            throw RecordingError.microphoneUnavailable
+    /// Mikrofonu kayıt sürerken açar ya da kapatır; kayıt kesilmez. İzin denetimi çağıranın işidir.
+    public func setMicrophoneEnabled(_ enabled: Bool) {
+        guard state == .recording, let sink, let microphone else { return }
+        sampleQueue.async { sink.microphoneEnabled = enabled }
+        microphone.setEnabled(enabled)
+        onEvent?(enabled ? "mikrofon açılıyor" : "mikrofon kapanıyor")
+    }
+
+    /// Sessizlik doldurma ve sistem sesi bekçisi: yarım saniyede bir, örnek kuyruğunda.
+    private func startMaintenance() {
+        guard let sink else { return }
+        let timer = DispatchSource.makeTimerSource(queue: sampleQueue)
+        timer.schedule(deadline: .now() + 0.5, repeating: 0.5)
+        let recordsSystemAudio = request?.recordsSystemAudio ?? false
+        timer.setEventHandler { [weak self] in
+            guard !sink.isClosed else { return }
+            let now = CMClockGetTime(CMClockGetHostTimeClock())
+            sink.writer.fillAudioGaps(upTo: CMTimeSubtract(now, Self.gapFillDelay))
+            if recordsSystemAudio, sink.writer.hasStarted,
+               ProcessInfo.processInfo.systemUptime - sink.lastSystemAudioUptime > Self.systemAudioStaleAfter
+            {
+                DispatchQueue.main.async { self?.restartSystemAudio(reason: "sistem sesi gelmiyor") }
+            }
         }
-        session.addInput(input)
-        session.addOutput(output)
-        session.commitConfiguration()
-        sink.microphoneSession = session
-        return session
+        timer.resume()
+        maintenanceTimer = timer
+    }
+
+    /// ScreenCaptureKit'in ses yakalamasını kapatıp açar; görüntü akışı sürer.
+    public func restartSystemAudio(reason: String) {
+        guard state == .recording, let stream, let configuration, let sink, !isRestartingSystemAudio else { return }
+        let now = ProcessInfo.processInfo.systemUptime
+        guard now - lastSystemAudioRestartUptime > Self.systemAudioStaleAfter else { return }
+        lastSystemAudioRestartUptime = now
+        isRestartingSystemAudio = true
+        onEvent?("sistem sesi yeniden bağlanıyor (\(reason))")
+        // Yeniden denemeden önce sayaç sıfırlanır: bekçi aynı anda ikinci kez tetiklemesin.
+        sampleQueue.async { sink.lastSystemAudioUptime = ProcessInfo.processInfo.systemUptime }
+        configuration.capturesAudio = false
+        stream.updateConfiguration(configuration) { [weak self] _ in
+            configuration.capturesAudio = true
+            stream.updateConfiguration(configuration) { error in
+                DispatchQueue.main.async {
+                    self?.isRestartingSystemAudio = false
+                    self?.onEvent?(error == nil ? "sistem sesi yeniden bağlandı" : "sistem sesi yeniden bağlanamadı: \(error!.localizedDescription)")
+                }
+            }
+        }
     }
 
     // MARK: Durdur
@@ -185,7 +237,7 @@ public final class ScreenCaptureKitRecorder: NSObject, ScreenRecorder {
             return
         }
         state = .stopping
-        stopMicrophone()
+        stopAuxiliaryCapture()
         stream.stopCapture { [weak self] _ in
             // Hata olsa bile o ana kadar yazılanı kapatıp kaydederiz.
             self?.finalize(completion: completion)
@@ -196,16 +248,19 @@ public final class ScreenCaptureKitRecorder: NSObject, ScreenRecorder {
         // Ekran çıkarıldı ya da macOS paylaşımı durdurdu: o ana kadarki kaydı sakla.
         guard state == .recording else { return }
         state = .stopping
-        stopMicrophone()
+        stopAuxiliaryCapture()
         finalize { [weak self] result in
             self?.onUnexpectedStop?(result)
         }
     }
 
-    private func stopMicrophone() {
-        guard let microphoneSession else { return }
-        DispatchQueue.global(qos: .userInitiated).async {
-            microphoneSession.stopRunning()
+    private func stopAuxiliaryCapture() {
+        maintenanceTimer?.cancel()
+        maintenanceTimer = nil
+        if let microphone {
+            DispatchQueue.global(qos: .userInitiated).async {
+                microphone.invalidate()
+            }
         }
     }
 
@@ -218,6 +273,8 @@ public final class ScreenCaptureKitRecorder: NSObject, ScreenRecorder {
         sampleQueue.async {
             sink.isClosed = true
             let endTime = CMClockGetTime(CMClockGetHostTimeClock())
+            let writer = sink.writer
+            self.onEvent?("yazıcı: kare=\(writer.appendedVideoFrames) sistem sesi=\(writer.appendedSystemAudioBuffers)+\(writer.appendedSystemAudioSilenceBuffers) sessiz, mikrofon=\(writer.appendedMicrophoneBuffers)+\(writer.appendedMicrophoneSilenceBuffers) sessiz")
             sink.writer.finish(at: endTime) { error in
                 if let error {
                     DispatchQueue.main.async {
@@ -227,6 +284,14 @@ public final class ScreenCaptureKitRecorder: NSObject, ScreenRecorder {
                     return
                 }
                 let writtenURL = sink.writer.url
+                #if DEBUG
+                // Geliştirici testi: karıştırmadan önceki iki ses izli ara dosyanın kopyası saklanır.
+                if ProcessInfo.processInfo.environment["EKRANKAYDI_ARA_DOSYA"] == "1", writtenURL != request.outputURL {
+                    let copy = request.outputURL.deletingPathExtension().appendingPathExtension("iki-iz.mov")
+                    try? FileManager.default.removeItem(at: copy)
+                    try? FileManager.default.copyItem(at: writtenURL, to: copy)
+                }
+                #endif
                 guard writtenURL != request.outputURL else {
                     DispatchQueue.main.async {
                         self.cleanUp()
@@ -253,10 +318,14 @@ public final class ScreenCaptureKitRecorder: NSObject, ScreenRecorder {
     }
 
     private func cleanUp() {
+        maintenanceTimer?.cancel()
+        maintenanceTimer = nil
         stream = nil
         sink = nil
-        microphoneSession = nil
+        microphone = nil
+        configuration = nil
         request = nil
+        isRestartingSystemAudio = false
         state = .idle
     }
 
@@ -284,10 +353,18 @@ public final class ScreenCaptureKitRecorder: NSObject, ScreenRecorder {
 private final class CaptureSink: NSObject, SCStreamOutput, SCStreamDelegate, AVCaptureAudioDataOutputSampleBufferDelegate {
     let writer: MovieWriter
     let queue: DispatchQueue
-    weak var microphoneSession: AVCaptureSession?
+    var microphone: MicrophoneCapture?
     var onStreamError: ((Error) -> Void)?
     /// Durdurma başladıktan sonra gelen örnekler yazılmaz (yalnız `queue` üzerinde değişir).
     var isClosed = false
+    /// Mikrofon kapalıyken yolda kalan son arabellekler yazılmaz (yalnız `queue` üzerinde değişir).
+    var microphoneEnabled = false
+    #if DEBUG
+    var debugAudioCount = 0
+    var onDebug: ((String) -> Void)?
+    #endif
+    /// Son sistem sesi arabelleğinin geldiği an (yalnız `queue` üzerinde değişir).
+    var lastSystemAudioUptime = ProcessInfo.processInfo.systemUptime
 
     init(writer: MovieWriter, queue: DispatchQueue) {
         self.writer = writer
@@ -301,6 +378,16 @@ private final class CaptureSink: NSObject, SCStreamOutput, SCStreamDelegate, AVC
             guard Self.isCompleteFrame(sampleBuffer) else { return }
             writer.appendVideo(sampleBuffer)
         case .audio:
+            lastSystemAudioUptime = ProcessInfo.processInfo.systemUptime
+            #if DEBUG
+            if debugAudioCount < 3 {
+                debugAudioCount += 1
+                let pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer).seconds
+                let host = CMClockGetTime(CMClockGetHostTimeClock()).seconds
+                let start = writer.sessionStartTime?.seconds ?? -1
+                onDebug?(String(format: "sistem sesi pts=%.3f ana saat=%.3f oturum=%.3f örnek=%d", pts, host, start, CMSampleBufferGetNumSamples(sampleBuffer)))
+            }
+            #endif
             writer.appendSystemAudio(sampleBuffer)
         default:
             break
@@ -312,11 +399,12 @@ private final class CaptureSink: NSObject, SCStreamOutput, SCStreamDelegate, AVC
     }
 
     func captureOutput(_ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection) {
-        guard !isClosed, sampleBuffer.isValid else { return }
+        microphone?.noteSample()
+        guard !isClosed, microphoneEnabled, sampleBuffer.isValid else { return }
         // Mikrofon kendi saatine göre damgalanabilir; ekranla aynı (ana) saate çevrilir.
         let hostClock = CMClockGetHostTimeClock()
         var buffer: CMSampleBuffer? = sampleBuffer
-        if let clock = microphoneSession?.synchronizationClock, !CFEqual(clock, hostClock) {
+        if let clock = microphone?.session.synchronizationClock, !CFEqual(clock, hostClock) {
             let original = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
             let converted = CMSyncConvertTime(original, from: clock, to: hostClock)
             if original.isValid, converted.isValid {

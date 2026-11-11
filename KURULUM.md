@@ -13,17 +13,16 @@ Mac'in sürümüne bakmak için: sol üstteki elma simgesi › **Bu Mac Hakkınd
 ## 1. İndir
 
 1. Sürüm sayfasını aç: <https://github.com/OddAna/ekran-kaydi/releases/latest>
-2. **Ekran-Kaydi-1.0.0.zip** dosyasına tıkla, inecek.
+2. Sayfadaki **Ekran-Kaydi-<sürüm>.zip** dosyasına tıkla, inecek (ör. `Ekran-Kaydi-1.1.0.zip`).
 
-Depo gizli (private) olduğu için bu sayfa yalnız Burak'ın GitHub hesabıyla açılır. İki yol var:
+Sayfa herkese açıktır, GitHub hesabı gerekmez.
 
-- Laptopta tarayıcıdan GitHub'a Burak'ın hesabıyla girip indir, ya da
-- Kendi Mac'inde indir, AirDrop ya da USB bellekle laptopa at.
+Eski bir sürüm zaten kuruluysa aşağıdaki **Güncelleme** bölümündeki tek satır yeter.
 
 ## 2. Uygulamalar klasörüne taşı
 
 1. Finder'da **İndirilenler** klasörünü aç.
-2. **Ekran-Kaydi-1.0.0.zip** dosyasına çift tıkla. Yanında **Ekran Kaydı** uygulaması belirir.
+2. **Ekran-Kaydi-<sürüm>.zip** dosyasına çift tıkla. Yanında **Ekran Kaydı** uygulaması belirir.
 3. **Ekran Kaydı**'nı sürükleyip soldaki **Uygulamalar** klasörüne bırak.
 
 ## 3. İlk açılış (bir kez)
@@ -71,8 +70,11 @@ Yanlışlıkla **İzin Verme**'ye basarsan: **Sistem Ayarları** › **Gizlilik 
 2. **Ekran** altında kaydedilecek ekranı seç. Liste o an bu bilgisayara bağlı ekranlardan oluşur; tek ekran varsa zaten seçilidir.
 3. **Ses** altında **Bilgisayarın sesi** işaretli kalsın. Kendi sesin de girsin istersen **Mikrofon**'u da işaretle.
 4. **Kayıt yeri** altında **Filmler** ya da **Masaüstü**'nü seç.
-5. **Kaydı Başlat**'a bas. Daire kırmızı olur, yanında geçen süre yazar.
-6. Bitirmek için daireye tıklayıp **Kaydı Durdur** de. Kısa bir "Kaydediliyor…" yazısından sonra Finder açılır ve kayıt seçili olarak gösterilir.
+5. **Kaydı Başlat**'a bas. Daire dolu (●) olur, yanında geçen süre yazar. Simge menü çubuğundaki öteki
+   simgelerle aynı renkte kalır (koyu çubukta beyaz).
+6. Kayıt sürerken mikrofonu açıp kapatmak için daireye tıkla, **Mikrofon**'a bas (menü açıkken **M** tuşu da olur).
+   Kayıt kesilmez; mikrofon kapalıyken geçen süre kayıtta sessiz kalır. Seçim bir sonraki kayıt için de hatırlanır.
+7. Bitirmek için daireye tıklayıp **Kaydı Durdur** de. Kısa bir "Kaydediliyor…" yazısından sonra Finder açılır ve kayıt seçili olarak gösterilir.
 
 ## 6. Kayıt nereye düşer
 
@@ -93,5 +95,20 @@ Dosya QuickTime Player'da açılır, olduğu gibi WhatsApp'a, Drive'a ya da YouT
 - **"Ekran kaydı izni gerekiyor" uyarısı:** 4. adımı yeniden yap, sonra uygulamadan çıkıp yeniden aç.
 - **macOS ara sıra "ekranına erişmeye devam etsin mi" diye soruyor:** Bu macOS 15'in olağan hatırlatmasıdır; **İzin Ver** de.
 - **Kayıt sürerken ekranın üst köşesinde mor/renkli bir simge var:** macOS ekranın kaydedildiğini gösteriyor; normaldir.
+- **Kayıt sürerken kulaklık ya da AirPods takıldı/çıkarıldı:** Kayıt durmaz. Mikrofon macOS'un o anki
+  varsayılan girişine (ör. AirPods'un mikrofonu, çıkarınca Mac'in kendi mikrofonu) kendiliğinden geçer;
+  geçiş sırasındaki bir saniyeden kısa an sessiz kalır. Bilgisayarın sesi kulaklıktan da hoparlörden de kaydedilir.
 - **Kayıt sırasında ekran kablosu çıkarıldı:** Kayıt o ana kadar kaydedilen kısımla saklanır, uygulama bunu bir uyarıyla bildirir.
 - **Yeni sürüm kurdun ve izinler kayboldu:** Eski **Ekran Kaydı**'nı Çöp Sepeti'ne at, yenisini Uygulamalar'a koy, 3. ve 4. adımları bir kez daha yap.
+
+## Güncelleme
+
+**Terminal**'i aç (Uygulamalar › İzlenceler › Terminal), aşağıdaki satırı yapıştır, Enter'a bas. Kayıt sürüyorsa önce
+kaydedip kapatır, eski uygulamayı yenisiyle değiştirir ve açar:
+
+```sh
+osascript -e 'if application id "app.ekrankaydi.menubar" is running then tell application id "app.ekrankaydi.menubar" to quit'; sleep 3; curl -fsSL -o /tmp/Ekran-Kaydi.zip https://github.com/OddAna/ekran-kaydi/releases/latest/download/Ekran-Kaydi.zip && rm -rf "/Applications/Ekran Kaydı.app" && ditto -x -k /tmp/Ekran-Kaydi.zip /Applications && rm -f /tmp/Ekran-Kaydi.zip && { tccutil reset ScreenCapture app.ekrankaydi.menubar; tccutil reset Microphone app.ekrankaydi.menubar; } >/dev/null 2>&1; open "/Applications/Ekran Kaydı.app"
+```
+
+Uygulama imzasız (ad-hoc) olduğu için macOS her yeni sürümü yeni bir uygulama sayar: güncellemeden sonraki ilk
+kayıtta ekran kaydı (ve mikrofon açıksa mikrofon) izni bir kez daha istenir; 4. adımdaki gibi izin ver.

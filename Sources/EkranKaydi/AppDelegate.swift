@@ -1,6 +1,7 @@
 import AppKit
 import AVFoundation
 import EkranKaydiCore
+import os
 
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private enum Phase {
@@ -20,6 +21,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var timer: Timer?
     private var lastRecordingURL: URL?
     private var terminateAfterSaving = false
+    /// Kayıt sürerken mikrofonun gerçekte açık olup olmadığı (ayar açık olsa da izin yoksa kapalı başlar).
+    private var liveMicrophone = false
+    private let log = Logger(subsystem: "app.ekrankaydi.menubar", category: "kayit")
 
     // MARK: Yaşam döngüsü
 
@@ -31,7 +35,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         recorder.onUnexpectedStop = { [weak self] result in
             self?.finishSaving(result, unexpected: true)
         }
+        recorder.onEvent = { [log] message in
+            log.notice("\(message, privacy: .public)")
+            #if DEBUG
+            DebugAutotest.print(message)
+            #endif
+        }
         updateStatusButton()
+        #if DEBUG
+        DebugAutotest.runIfRequested(
+            statusItem: statusItem,
+            start: { [weak self] in self?.startRecording() },
+            toggleMicrophone: { [weak self] in self?.toggleMicrophone() },
+            restartSystemAudio: { [weak self] in
+                if #available(macOS 13.0, *) {
+                    (self?.recorder as? ScreenCaptureKitRecorder)?.restartSystemAudio(reason: "ototest")
+                }
+            },
+            stop: { [weak self] in self?.stopRecording() }
+        )
+        #endif
     }
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
@@ -100,9 +123,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         systemAudio.indentationLevel = 1
         menu.addItem(systemAudio)
-        let microphone = item("Mikrofon", action: #selector(toggleMicrophone))
-        microphone.state = settings.recordsMicrophone ? .on : .off
-        microphone.isEnabled = isIdle
+        let microphone: NSMenuItem
+        if case .recording = phase {
+            if recorder.supportsLiveMicrophoneToggle {
+                // Kayıt sürerken mikrofon açılıp kapatılabilir; kayıt kesilmez.
+                microphone = item("Mikrofon", action: #selector(toggleMicrophone), key: "m")
+                microphone.state = liveMicrophone ? .on : .off
+            } else {
+                microphone = disabled("Mikrofon (kayıt sürerken değiştirmek macOS 13 ve üstü gerekir)")
+                microphone.state = liveMicrophone ? .on : .off
+            }
+        } else {
+            microphone = item("Mikrofon", action: #selector(toggleMicrophone))
+            microphone.state = settings.recordsMicrophone ? .on : .off
+            microphone.isEnabled = isIdle
+        }
         microphone.indentationLevel = 1
         menu.addItem(microphone)
 
@@ -149,7 +184,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc private func toggleMicrophone() {
-        settings.recordsMicrophone.toggle()
+        guard case .recording = phase, recorder.supportsLiveMicrophoneToggle else {
+            settings.recordsMicrophone.toggle()
+            return
+        }
+        if liveMicrophone {
+            setLiveMicrophone(false)
+            return
+        }
+        withLiveMicrophonePermission { [weak self] granted in
+            guard let self, granted, case .recording = self.phase else { return }
+            self.setLiveMicrophone(true)
+        }
+    }
+
+    /// Kayıt sürerken mikrofonu açar/kapatır; seçim bir sonraki kayıt için de saklanır.
+    private func setLiveMicrophone(_ enabled: Bool) {
+        liveMicrophone = enabled
+        settings.recordsMicrophone = enabled
+        recorder.setMicrophoneEnabled(enabled)
+        updateStatusButton()
     }
 
     @objc private func selectSaveLocation(_ sender: NSMenuItem) {
@@ -230,6 +284,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                     self.completePendingTermination()
                     return
                 }
+                self.liveMicrophone = useMicrophone
                 self.phase = .recording(startedAt: Date())
                 self.startTimer()
                 self.updateStatusButton()
@@ -326,6 +381,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
+    /// Kayıt sürerken mikrofonu açmadan önce izin. İzin yoksa kayıt mikrofonsuz sürer, nereden açılacağı söylenir.
+    private func withLiveMicrophonePermission(_ decide: @escaping (Bool) -> Void) {
+        switch AVCaptureDevice.authorizationStatus(for: .audio) {
+        case .authorized:
+            decide(true)
+        case .notDetermined:
+            AVCaptureDevice.requestAccess(for: .audio) { granted in
+                DispatchQueue.main.async { decide(granted) }
+            }
+        default:
+            let alert = NSAlert()
+            alert.messageText = "Mikrofon izni kapalı."
+            alert.informativeText = "Kayıt mikrofonsuz sürüyor. Sistem Ayarları › Gizlilik ve Güvenlik › Mikrofon bölümünden \"Ekran Kaydı\"nı açabilirsiniz."
+            alert.addButton(withTitle: "Ayarları Aç")
+            alert.addButton(withTitle: "Tamam")
+            if runAlert(alert) == .alertFirstButtonReturn {
+                PermissionText.openMicrophoneSettings()
+            }
+            decide(false)
+        }
+    }
+
     private func askToContinueWithoutMicrophone(reason: String) -> Bool? {
         let alert = NSAlert()
         alert.messageText = reason
@@ -363,6 +440,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             title = " Kaydediliyor…"
         }
 
+        // Simge her durumda şablon (template) görüntüdür: macOS onu menü çubuğunun öteki simgeleri gibi
+        // (koyu çubukta beyaz, açık çubukta siyah) çizer. Kayıtta renk verilmez; renkli (tint) simge yeni
+        // macOS menü çubuğunda siyaha dönüp kayboluyordu. Kayıt dolu daire ve yanındaki süreyle anlaşılır.
         if let image = NSImage(systemSymbolName: isActive ? "record.circle.fill" : "record.circle", accessibilityDescription: "Ekran Kaydı")
         {
             image.isTemplate = true
@@ -373,9 +453,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             button.image = nil
             button.title = (isActive ? "●" : "○") + title
         }
-        button.contentTintColor = isActive ? .systemRed : nil
+        button.contentTintColor = nil
+        #if DEBUG
+        // Karşılaştırma için 1.0.0'ın davranışı (kayıtta kırmızı tint): yalnız geliştirici derlemesi.
+        if ProcessInfo.processInfo.environment["EKRANKAYDI_ESKI_RENK"] == "1" {
+            button.contentTintColor = isActive ? .systemRed : nil
+        }
+        #endif
         button.font = NSFont.monospacedDigitSystemFont(ofSize: NSFont.systemFontSize, weight: .regular)
-        button.toolTip = isActive ? "Ekran Kaydı · kayıt sürüyor" : "Ekran Kaydı"
+        if case .recording = phase {
+            button.toolTip = "Ekran Kaydı · kayıt sürüyor · mikrofon " + (liveMicrophone ? "açık" : "kapalı")
+        } else {
+            button.toolTip = isActive ? "Ekran Kaydı · kayıt sürüyor" : "Ekran Kaydı"
+        }
     }
 
     private func startTimer() {

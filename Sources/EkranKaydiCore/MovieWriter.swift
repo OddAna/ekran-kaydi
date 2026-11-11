@@ -6,6 +6,10 @@ import Foundation
 ///
 /// İş parçacığı güvenli değildir: tüm çağrılar aynı seri kuyruktan yapılmalıdır.
 /// Zaman damgaları ana saat (host time) cinsindendir; oturum ilk görüntü karesiyle başlar.
+///
+/// Ses izleri kesintisizdir: mikrofon kapatıldığında, aygıt değişirken (kulaklık takılıp çıkarılırken) ya da
+/// bir kaynak bir süre ses vermediğinde aradaki boşluk sessizlikle doldurulur. Böylece iz zamanda kaymaz,
+/// mikrofon yeniden açılınca ses görüntüyle aynı yere düşer.
 final class MovieWriter {
     struct Configuration {
         var width: Int
@@ -17,20 +21,28 @@ final class MovieWriter {
 
     static let audioSampleRate: Double = 48_000
     static let audioChannelCount = 2
+    /// Bu kadar küçük zaman farkları boşluk ya da çakışma sayılmaz (saat dönüşümü titremesi).
+    static let audioTimingTolerance = CMTime(value: 5, timescale: 1000)
+    /// Sessizlik en çok bu uzunlukta parçalarla yazılır (0,1 sn).
+    static let silenceChunkFrames = 4800
 
     let url: URL
     private let configuration: Configuration
     private let writer: AVAssetWriter
     private let videoInput: AVAssetWriterInput
-    private let systemAudioInput: AVAssetWriterInput?
-    private let microphoneInput: AVAssetWriterInput?
+    private let systemAudio: AudioTrack?
+    private let microphone: AudioTrack?
 
     private(set) var sessionStartTime: CMTime?
     private(set) var lastVideoTime: CMTime = .invalid
     private var lastVideoBuffer: CMSampleBuffer?
     private(set) var appendedVideoFrames = 0
-    private(set) var appendedSystemAudioBuffers = 0
-    private(set) var appendedMicrophoneBuffers = 0
+    var appendedSystemAudioBuffers: Int { systemAudio?.realBuffers ?? 0 }
+    var appendedMicrophoneBuffers: Int { microphone?.realBuffers ?? 0 }
+    var appendedMicrophoneSilenceBuffers: Int { microphone?.silenceBuffers ?? 0 }
+    var appendedSystemAudioSilenceBuffers: Int { systemAudio?.silenceBuffers ?? 0 }
+    /// Mikrofon izinin şu ana kadar yazılmış bitişi (gerçek ses ya da sessizlik).
+    var microphoneCursor: CMTime { microphone?.cursor ?? .invalid }
     private(set) var failureDescription: String?
     private var isFinishing = false
 
@@ -79,8 +91,14 @@ final class MovieWriter {
             return input
         }
 
-        systemAudioInput = configuration.includesSystemAudio ? try makeAudioInput(bitRate: 192_000) : nil
-        microphoneInput = configuration.includesMicrophone ? try makeAudioInput(bitRate: 160_000) : nil
+        // Sistem sesinin biçimini ScreenCaptureKit belirler; sessizlik ancak ilk gerçek ses geldikten sonra
+        // aynı biçimde yazılır. Mikrofonun biçimi sabittir (`linearPCMSettings`), sessizlik baştan yazılabilir.
+        systemAudio = configuration.includesSystemAudio
+            ? AudioTrack(input: try makeAudioInput(bitRate: 192_000), fallbackFormat: nil)
+            : nil
+        microphone = configuration.includesMicrophone
+            ? AudioTrack(input: try makeAudioInput(bitRate: 160_000), fallbackFormat: MovieWriter.interleavedFloatFormat)
+            : nil
 
         guard writer.startWriting() else {
             throw RecordingError.writeFailed(writer.error?.localizedDescription ?? "Dosya açılamadı.")
@@ -97,6 +115,33 @@ final class MovieWriter {
         AVLinearPCMIsNonInterleaved: false,
         AVLinearPCMIsBigEndianKey: false,
     ]
+
+    /// `linearPCMSettings` ile aynı biçimin CoreMedia tanımı (mikrofon izine sessizlik yazmak için).
+    static let interleavedFloatFormat: CMAudioFormatDescription? = {
+        var description = AudioStreamBasicDescription(
+            mSampleRate: audioSampleRate,
+            mFormatID: kAudioFormatLinearPCM,
+            mFormatFlags: kAudioFormatFlagIsFloat | kAudioFormatFlagIsPacked,
+            mBytesPerPacket: UInt32(4 * audioChannelCount),
+            mFramesPerPacket: 1,
+            mBytesPerFrame: UInt32(4 * audioChannelCount),
+            mChannelsPerFrame: UInt32(audioChannelCount),
+            mBitsPerChannel: 32,
+            mReserved: 0
+        )
+        var format: CMAudioFormatDescription?
+        let status = CMAudioFormatDescriptionCreate(
+            allocator: kCFAllocatorDefault,
+            asbd: &description,
+            layoutSize: 0,
+            layout: nil,
+            magicCookieSize: 0,
+            magicCookie: nil,
+            extensions: nil,
+            formatDescriptionOut: &format
+        )
+        return status == noErr ? format : nil
+    }()
 
     static func aacSettings(bitRate: Int) -> [String: Any] {
         [
@@ -134,29 +179,94 @@ final class MovieWriter {
     }
 
     func appendSystemAudio(_ sampleBuffer: CMSampleBuffer) {
-        guard let input = systemAudioInput else { return }
-        if appendAudio(sampleBuffer, to: input) {
-            appendedSystemAudioBuffers += 1
-        }
+        guard let systemAudio else { return }
+        appendAudio(sampleBuffer, to: systemAudio)
     }
 
     func appendMicrophone(_ sampleBuffer: CMSampleBuffer) {
-        guard let input = microphoneInput else { return }
-        if appendAudio(sampleBuffer, to: input) {
-            appendedMicrophoneBuffers += 1
+        guard let microphone else { return }
+        appendAudio(sampleBuffer, to: microphone)
+    }
+
+    /// Ses gelmeyen izleri (mikrofon kapalı, aygıt değişiyor, kaynak sustu) `time` anına kadar sessizlikle doldurur.
+    /// Gerçek ses `time`dan sonrası için gelmeye devam ederse aynen yazılır; `time`dan eski gerçek ses atlanır.
+    func fillAudioGaps(upTo time: CMTime) {
+        guard !isFinishing, checkWriter(), sessionStartTime != nil, time.isValid else { return }
+        for track in [systemAudio, microphone].compactMap({ $0 }) {
+            fillSilence(in: track, upTo: time)
         }
     }
 
-    private func appendAudio(_ sampleBuffer: CMSampleBuffer, to input: AVAssetWriterInput) -> Bool {
+    @discardableResult
+    private func appendAudio(_ sampleBuffer: CMSampleBuffer, to track: AudioTrack) -> Bool {
         guard !isFinishing, checkWriter(), let start = sessionStartTime else { return false }
         let time = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
-        guard time.isValid, CMTimeCompare(time, start) >= 0 else { return false }
-        guard input.isReadyForMoreMediaData else { return false }
-        if input.append(sampleBuffer) {
+        guard time.isValid else { return false }
+        let end = CMTimeAdd(time, Self.audioDuration(of: sampleBuffer))
+        if !track.cursor.isValid {
+            track.cursor = start
+        }
+        let tolerance = Self.audioTimingTolerance
+        // Oturumdan önceki ya da zaten (sessizlikle) yazılmış ana düşen ses atlanır: iz geriye gidemez.
+        if CMTimeCompare(time, CMTimeSubtract(track.cursor, tolerance)) < 0 {
+            return false
+        }
+        if let format = CMSampleBufferGetFormatDescription(sampleBuffer) {
+            track.format = format
+        }
+        if CMTimeCompare(time, CMTimeAdd(track.cursor, tolerance)) > 0 {
+            fillSilence(in: track, upTo: time)
+        }
+        guard track.input.isReadyForMoreMediaData else { return false }
+        if track.input.append(sampleBuffer) {
+            track.cursor = end
+            track.realBuffers += 1
             return true
         }
         _ = checkWriter()
         return false
+    }
+
+    private func fillSilence(in track: AudioTrack, upTo target: CMTime) {
+        guard let start = sessionStartTime, let format = track.format ?? track.fallbackFormat,
+              let description = CMAudioFormatDescriptionGetStreamBasicDescription(format)?.pointee,
+              description.mSampleRate > 0
+        else {
+            return
+        }
+        if !track.cursor.isValid {
+            track.cursor = start
+        }
+        let rate = CMTimeScale(description.mSampleRate.rounded())
+        while CMTimeCompare(target, CMTimeAdd(track.cursor, Self.audioTimingTolerance)) > 0 {
+            let remaining = CMTimeSubtract(target, track.cursor)
+            let frames = min(Self.silenceChunkFrames, Int((remaining.seconds * Double(rate)).rounded()))
+            guard frames > 0, track.input.isReadyForMoreMediaData,
+                  let silence = SilenceBuffer.make(format: format, description: description, frames: frames, at: track.cursor)
+            else {
+                return
+            }
+            guard track.input.append(silence) else {
+                _ = checkWriter()
+                return
+            }
+            track.cursor = CMTimeAdd(track.cursor, CMTime(value: CMTimeValue(frames), timescale: rate))
+            track.silenceBuffers += 1
+        }
+    }
+
+    private static func audioDuration(of sampleBuffer: CMSampleBuffer) -> CMTime {
+        let duration = CMSampleBufferGetDuration(sampleBuffer)
+        if duration.isValid, duration.isNumeric, CMTimeCompare(duration, .zero) > 0 {
+            return duration
+        }
+        let frames = CMSampleBufferGetNumSamples(sampleBuffer)
+        if let format = CMSampleBufferGetFormatDescription(sampleBuffer),
+           let rate = CMAudioFormatDescriptionGetStreamBasicDescription(format)?.pointee.mSampleRate, rate > 0
+        {
+            return CMTime(value: CMTimeValue(frames), timescale: CMTimeScale(rate.rounded()))
+        }
+        return CMTime(value: CMTimeValue(frames), timescale: CMTimeScale(audioSampleRate))
     }
 
     /// Kaydı `endTime` anında kapatır. Ekran son kareden sonra değişmediyse son kare bitişe kadar uzatılır,
@@ -199,9 +309,15 @@ final class MovieWriter {
         }
         lastVideoBuffer = nil
 
+        // Ses izleri de bitişe kadar uzar (ör. mikrofon sonda kapalıydı).
+        // Hiç ses gelmemiş sistem sesi izi boş kalır (biçimi bilinmiyor; karıştırıcı bunu kaldırır).
+        for track in [systemAudio, microphone].compactMap({ $0 }) {
+            fillSilence(in: track, upTo: end)
+        }
+
         videoInput.markAsFinished()
-        systemAudioInput?.markAsFinished()
-        microphoneInput?.markAsFinished()
+        systemAudio?.input.markAsFinished()
+        microphone?.input.markAsFinished()
         writer.endSession(atSourceTime: end)
 
         let writer = self.writer
@@ -232,6 +348,59 @@ final class MovieWriter {
             return false
         }
         return writer.status == .writing
+    }
+}
+
+/// Bir ses izinin yazıcı tarafı: giriş, şu ana kadar yazılan bitiş ve sessizlik için biçim.
+private final class AudioTrack {
+    let input: AVAssetWriterInput
+    let fallbackFormat: CMAudioFormatDescription?
+    var format: CMAudioFormatDescription?
+    var cursor: CMTime = .invalid
+    var realBuffers = 0
+    var silenceBuffers = 0
+
+    init(input: AVAssetWriterInput, fallbackFormat: CMAudioFormatDescription?) {
+        self.input = input
+        self.fallbackFormat = fallbackFormat
+    }
+}
+
+/// Verilen ham ses (LPCM) biçiminde sıfırlarla dolu bir ses arabelleği.
+enum SilenceBuffer {
+    static func make(format: CMAudioFormatDescription, description: AudioStreamBasicDescription, frames: Int, at time: CMTime) -> CMSampleBuffer? {
+        guard description.mFormatID == kAudioFormatLinearPCM, description.mBytesPerFrame > 0, frames > 0 else {
+            return nil
+        }
+        let nonInterleaved = description.mFormatFlags & kAudioFormatFlagIsNonInterleaved != 0
+        let planes = nonInterleaved ? Int(max(1, description.mChannelsPerFrame)) : 1
+        let byteCount = frames * Int(description.mBytesPerFrame) * planes
+        var block: CMBlockBuffer?
+        guard CMBlockBufferCreateWithMemoryBlock(
+            allocator: kCFAllocatorDefault,
+            memoryBlock: nil,
+            blockLength: byteCount,
+            blockAllocator: kCFAllocatorDefault,
+            customBlockSource: nil,
+            offsetToData: 0,
+            dataLength: byteCount,
+            flags: kCMBlockBufferAssureMemoryNowFlag,
+            blockBufferOut: &block
+        ) == noErr, let block, CMBlockBufferFillDataBytes(with: 0, blockBuffer: block, offsetIntoDestination: 0, dataLength: byteCount) == noErr else {
+            return nil
+        }
+        let rate = CMTimeScale(description.mSampleRate.rounded())
+        var sample: CMSampleBuffer?
+        let status = CMAudioSampleBufferCreateReadyWithPacketDescriptions(
+            allocator: kCFAllocatorDefault,
+            dataBuffer: block,
+            formatDescription: format,
+            sampleCount: frames,
+            presentationTimeStamp: CMTimeConvertScale(time, timescale: rate, method: .roundHalfAwayFromZero),
+            packetDescriptions: nil,
+            sampleBufferOut: &sample
+        )
+        return status == noErr ? sample : nil
     }
 }
 

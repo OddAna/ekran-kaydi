@@ -4,6 +4,7 @@ import Foundation
 public struct RecordingRequest {
     public let display: DisplayChoice
     public let recordsSystemAudio: Bool
+    /// Kayıt başlarken mikrofonun açık olup olmadığı; macOS 13+ kayıt sürerken değiştirilebilir.
     public let recordsMicrophone: Bool
     public let outputURL: URL
     public let framesPerSecond: Int
@@ -59,8 +60,14 @@ public enum RecordingError: LocalizedError, Equatable {
 public protocol ScreenRecorder: AnyObject {
     /// Kayıt beklenmedik biçimde bittiğinde (ekran çıkarıldı, sistem paylaşımı durdurdu) çağrılır.
     var onUnexpectedStop: ((Result<URL, Error>) -> Void)? { get set }
+    /// Teşhis için kısa olay satırları (mikrofon/ses aygıtı değişimi). Herhangi bir kuyrukta gelebilir.
+    var onEvent: ((String) -> Void)? { get set }
+    /// Mikrofon kayıt sürerken açılıp kapatılabiliyor mu (macOS 13+ evet; macOS 12'deki `screencapture` hayır).
+    var supportsLiveMicrophoneToggle: Bool { get }
     func start(_ request: RecordingRequest, completion: @escaping (Error?) -> Void)
     func stop(completion: @escaping (Result<URL, Error>) -> Void)
+    /// Kayıt sürerken mikrofonu açar/kapatır; kayıt kesilmez. Desteklemeyen motor yok sayar.
+    func setMicrophoneEnabled(_ enabled: Bool)
 }
 
 /// Çalıştığı macOS'a göre hangi kayıt yolunun kullanılacağı.

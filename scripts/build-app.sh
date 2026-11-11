@@ -4,7 +4,7 @@
 # Çıktı: dist/Ekran Kaydı.app ve dist/Ekran-Kaydi-<sürüm>.zip
 set -eu
 
-VERSION="${1:-1.0.0}"
+VERSION="${1:-1.1.0}"
 BUILD="${2:-1}"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
@@ -17,7 +17,7 @@ ZIP="$DIST/Ekran-Kaydi-$VERSION.zip"
 swift build -c release --arch arm64 --arch x86_64
 BIN="$(swift build -c release --arch arm64 --arch x86_64 --show-bin-path)/EkranKaydi"
 
-rm -rf "$APP" "$ZIP"
+rm -rf "$APP" "$ZIP" "$DIST/Ekran-Kaydi.zip"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp "$BIN" "$APP/Contents/MacOS/EkranKaydi"
 # Derleme makinesinin araç zinciri yolu (rpath) pakete girmesin.
@@ -36,6 +36,8 @@ codesign --force --sign - --timestamp=none "$APP"
 codesign --verify --strict --verbose=1 "$APP"
 
 ditto -c -k --sequesterRsrc --keepParent "$APP" "$ZIP"
+# Sürümsüz adlı kopya: güncelleme komutu her zaman releases/latest/download/Ekran-Kaydi.zip'i indirir.
+cp "$ZIP" "$DIST/Ekran-Kaydi.zip"
 echo "app: $APP"
 echo "zip: $ZIP"
 lipo -archs "$APP/Contents/MacOS/EkranKaydi"
